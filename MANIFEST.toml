@@ -1,0 +1,31 @@
+[manifest]
+repo       = "VCP"
+role       = "vantage-connection-protocol"
+version    = "0.1.0"
+security   = "high"
+port       = 7791
+
+[protocol]
+kind       = "device-session-broker"
+transports = ["http", "ble", "mdns", "nostr"]
+
+[handshake]
+steps = ["discovery", "challenge", "auth", "cap_neg", "grant", "session", "receipt"]
+
+[events]
+emits    = ["device.registered", "session.started", "session.revoked", "receipt.issued"]
+consumes = []
+
+[receipts]
+kind = "vcp_session"
+arp  = true
+nostr_kind = 31020
+
+[security]
+auth = "ed25519"
+capability_model = "scoped-expiring"
+safety_classes = ["Observer", "LowImpact", "IndoorMotion", "OutdoorMotion", "Aerial", "Critical"]
+
+[dependencies]
+required  = []
+optional  = ["vantage", "omo-koda2", "witness"]

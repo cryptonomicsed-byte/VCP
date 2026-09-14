@@ -1,0 +1,14 @@
+[package]
+name        = "vcp-types"
+version     = "0.1.0"
+edition     = "2021"
+description = "Vantage Connection Protocol — pure wire types for device discovery, capability negotiation, session management, and receipts. Zero I/O."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { workspace = true }
+thiserror  = { workspace = true }
+sha2       = { workspace = true }
+hex        = { workspace = true }
+chrono     = { workspace = true }
