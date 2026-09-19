@@ -1,4 +1,5 @@
 use chrono::Utc;
+use std::sync::RwLock;
 use uuid::Uuid;
 use vcp_types::{
     AuthResponse, CapabilityGrant, CapabilityNegotiation, ChallengeRequest,
@@ -12,9 +13,12 @@ use crate::crypto::verify_auth_signature;
 ///
 /// One HandshakeEngine instance is shared across all concurrent sessions.
 /// Sessions are identified by UUID; state is held in SessionStore.
+/// `graph` accumulates cross-index edges — one `vcp_session` edge per
+/// completed session linking device_canonical_id → receipt_canonical_id.
 pub struct HandshakeEngine {
     pub registry: DeviceRegistry,
     pub sessions: SessionStore,
+    pub graph:    RwLock<gix_core::GlyphGraph>,
 }
 
 impl HandshakeEngine {
@@ -22,6 +26,7 @@ impl HandshakeEngine {
         Self {
             registry: DeviceRegistry::new(),
             sessions: SessionStore::new(),
+            graph:    RwLock::new(gix_core::GlyphGraph::new()),
         }
     }
 
@@ -238,6 +243,29 @@ impl HandshakeEngine {
         );
 
         let composite = gix_types::gix_fold_v1(&[device_env.canonical_id, receipt_env.canonical_id]);
+        let device_hex  = hex::encode(device_env.canonical_id);
+        let receipt_hex = hex::encode(receipt_env.canonical_id);
+
+        // Insert cross-index edge into GlyphGraph: device → receipt via vcp_session.
+        {
+            let mut g = self.graph.write().unwrap();
+            g.add_node(gix_types::GlyphNode::from_chunk(&device_hex, ts as f64 / 1000.0));
+            g.add_node(gix_types::GlyphNode::from_chunk(&receipt_hex, ts as f64 / 1000.0));
+            g.add_edge(gix_types::GlyphEdge {
+                from:     device_hex.clone(),
+                to:       receipt_hex.clone(),
+                relation: "vcp_session".into(),
+                weight:   1,
+            });
+        }
+
+        tracing::debug!(
+            session_id = %session_id,
+            device_gix1 = %device_hex,
+            receipt_gix1 = %receipt_hex,
+            "GIX cross-link: device → receipt via vcp_session"
+        );
+
         Some(hex::encode(composite))
     }
 
@@ -268,4 +296,94 @@ impl HandshakeEngine {
 
 impl Default for HandshakeEngine {
     fn default() -> Self { Self::new() }
+}
+
+#[cfg(test)]
+mod gix_tests {
+    use super::*;
+    use vcp_types::VcpReceipt;
+    use chrono::Utc;
+
+    fn make_receipt(session_id: Uuid) -> VcpReceipt {
+        VcpReceipt {
+            receipt_id:        Uuid::new_v4(),
+            session_id,
+            grant_id:          Uuid::new_v4(),
+            device_id:         "dev-001".into(),
+            agent_did:         "did:test:agent".into(),
+            owner_did:         "did:test:owner".into(),
+            started_at:        Utc::now(),
+            ended_at:          Utc::now(),
+            outcome:           vcp_types::SessionOutcome::Success,
+            message_count:     0,
+            command_count:     0,
+            telemetry_count:   0,
+            telemetry_hash:    None,
+            trajectory_hash:   None,
+            sim_proof_id:      None,
+            witnesses:         vec![],
+            zangbeto_anchor:   None,
+            gix1_canonical_id: None,
+            device_signature:  String::new(),
+            agent_signature:   String::new(),
+        }
+    }
+
+    fn engine_with_active_session() -> (HandshakeEngine, Uuid) {
+        use vcp_types::{ChallengeRequest, CapabilityGrant, GrantScope};
+        use vcp_types::device::SafetyClass;
+        let engine = HandshakeEngine::new();
+        let sid = Uuid::new_v4();
+        let challenge = ChallengeRequest {
+            challenge_id:     Uuid::new_v4(),
+            nonce:            "nonce".into(),
+            issued_at:        Utc::now(),
+            expires_in_secs:  60,
+            required_caps:    vec![],
+            required_safety:  SafetyClass::Observer,
+        };
+        engine.sessions.insert_challenged(sid, challenge);
+        let grant = CapabilityGrant {
+            grant_id:         Uuid::new_v4(),
+            challenge_id:     Uuid::new_v4(),
+            device_id:        "dev-001".into(),
+            agent_did:        "did:test:agent".into(),
+            session_id:       sid,
+            scope:            GrantScope::Exclusive,
+            granted_caps:     vec![],
+            max_safety:       SafetyClass::Observer,
+            issued_at:        Utc::now(),
+            expires_at:       Utc::now(),
+            agent_signature:  String::new(),
+            parent_signature: None,
+        };
+        engine.sessions.activate(sid, grant).unwrap();
+        (engine, sid)
+    }
+
+    #[test]
+    fn session_composite_gix1_returns_hex() {
+        let (engine, sid) = engine_with_active_session();
+        let receipt = make_receipt(sid);
+        let composite = engine.session_composite_gix1(sid, &receipt);
+        assert!(composite.is_some());
+        assert_eq!(composite.unwrap().len(), 64);
+    }
+
+    #[test]
+    fn session_composite_gix1_inserts_graph_edge() {
+        let (engine, sid) = engine_with_active_session();
+        let receipt = make_receipt(sid);
+        engine.session_composite_gix1(sid, &receipt);
+        let g = engine.graph.read().unwrap();
+        assert_eq!(g.edge_count(), 1, "should have exactly one vcp_session edge");
+        assert_eq!(g.node_count(), 2, "device node + receipt node");
+    }
+
+    #[test]
+    fn session_composite_returns_none_for_missing_session() {
+        let engine = HandshakeEngine::new();
+        let receipt = make_receipt(Uuid::new_v4());
+        assert!(engine.session_composite_gix1(Uuid::new_v4(), &receipt).is_none());
+    }
 }
