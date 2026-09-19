@@ -436,6 +436,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gix-core"
+version = "0.1.0"
+dependencies = [
+ "gix-types",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "gix-types"
 version = "0.1.0"
 dependencies = [
@@ -1726,6 +1737,7 @@ dependencies = [
  "axum",
  "chrono",
  "ed25519-dalek",
+ "gix-core",
  "gix-types",
  "hex",
  "reqwest",
