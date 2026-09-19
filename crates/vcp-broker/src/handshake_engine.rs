@@ -1,5 +1,5 @@
 use chrono::Utc;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 use vcp_types::{
     AuthResponse, CapabilityGrant, CapabilityNegotiation, ChallengeRequest,
@@ -8,6 +8,7 @@ use vcp_types::{
 
 use crate::{DeviceRegistry, SessionStore};
 use crate::crypto::verify_auth_signature;
+use crate::storage::StorageBackend;
 
 /// Drives the 7-step VCP handshake state machine.
 ///
@@ -15,19 +16,57 @@ use crate::crypto::verify_auth_signature;
 /// Sessions are identified by UUID; state is held in SessionStore.
 /// `graph` accumulates cross-index edges — one `vcp_session` edge per
 /// completed session linking device_canonical_id → receipt_canonical_id.
+///
+/// If a `StorageBackend` is provided at construction time the engine will
+/// automatically persist the GlyphGraph after every mutation that adds edges,
+/// making the persisted graph operationally authoritative between restarts.
 pub struct HandshakeEngine {
     pub registry: DeviceRegistry,
     pub sessions: SessionStore,
     pub graph:    RwLock<gix_core::GlyphGraph>,
+    storage:      Option<Arc<dyn StorageBackend>>,
 }
 
 impl HandshakeEngine {
+    /// Create an engine with no persistence (in-memory only, suitable for tests).
     pub fn new() -> Self {
         Self {
             registry: DeviceRegistry::new(),
             sessions: SessionStore::new(),
             graph:    RwLock::new(gix_core::GlyphGraph::new()),
+            storage:  None,
         }
+    }
+
+    /// Create an engine that loads prior GIX state from `backend` on startup and
+    /// persists the GlyphGraph after every mutation that adds new edges.
+    ///
+    /// Recovery semantics:
+    ///   - Missing file   → empty graph (first boot, not an error)
+    ///   - Corrupted file → `Err` returned; caller decides whether to abort or boot empty
+    pub fn with_storage(backend: Arc<dyn StorageBackend>) -> Result<Self, String> {
+        let graph = backend.load_graph()?;
+        tracing::info!(
+            nodes = graph.node_count(),
+            edges = graph.edge_count(),
+            "GIX GlyphGraph restored from storage"
+        );
+        Ok(Self {
+            registry: DeviceRegistry::new(),
+            sessions: SessionStore::new(),
+            graph:    RwLock::new(graph),
+            storage:  Some(backend),
+        })
+    }
+
+    /// Flush the current GlyphGraph to the configured backend.
+    ///
+    /// Called automatically after any edge-adding operation. Also callable
+    /// explicitly during graceful shutdown to guarantee a final checkpoint.
+    pub fn flush_graph(&self) -> Result<(), String> {
+        let Some(ref backend) = self.storage else { return Ok(()); };
+        let g = self.graph.read().map_err(|e| format!("graph lock poisoned: {e}"))?;
+        backend.save_graph(&*g)
     }
 
     // ── step 1: discovery ─────────────────────────────────────────────────────
@@ -265,6 +304,12 @@ impl HandshakeEngine {
             receipt_gix1 = %receipt_hex,
             "GIX cross-link: device → receipt via vcp_session"
         );
+
+        // Auto-persist: flush graph immediately after the new edge lands so the
+        // `vcp_session` provenance chain survives an unexpected broker restart.
+        if let Err(e) = self.flush_graph() {
+            tracing::warn!("GIX graph flush failed after vcp_session edge: {e}");
+        }
 
         Some(hex::encode(composite))
     }

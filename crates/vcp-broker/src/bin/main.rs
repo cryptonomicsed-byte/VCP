@@ -28,7 +28,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
-use vcp_broker::{HandshakeEngine};
+use vcp_broker::{HandshakeEngine, JsonFileBackend};
 use vcp_types::{DeviceManifest, GrantScope};
 
 #[derive(Clone)]
@@ -190,8 +190,21 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(7791);
 
-    let engine = Arc::new(HandshakeEngine::new());
-    let state  = AppState { engine };
+    // Phase 8A: runtime persistence lifecycle.
+    // Load prior GIX GlyphGraph from durable storage on startup; fall back to
+    // an empty in-memory engine if storage is unavailable or corrupted.
+    let backend = Arc::new(JsonFileBackend::from_env());
+    let engine = match HandshakeEngine::with_storage(backend) {
+        Ok(e) => {
+            tracing::info!("VCP broker started with persistent GIX storage");
+            Arc::new(e)
+        }
+        Err(e) => {
+            tracing::warn!("GIX storage load failed ({e}); starting with empty graph");
+            Arc::new(HandshakeEngine::new())
+        }
+    };
+    let state  = AppState { engine: engine.clone() };
 
     let app = Router::new()
         .route("/api/devices/register",        post(register_device))
@@ -208,5 +221,20 @@ async fn main() {
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("vcp-broker listening on {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+
+    // Graceful shutdown: flush the GIX GlyphGraph before the process exits so
+    // every `vcp_session` edge accumulated during this run is durable.
+    let shutdown_engine = engine.clone();
+    let shutdown_signal = async move {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("vcp-broker shutting down — flushing GIX graph");
+        if let Err(e) = shutdown_engine.flush_graph() {
+            tracing::error!("GIX graph final flush failed: {e}");
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
 }
