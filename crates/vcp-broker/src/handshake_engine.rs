@@ -28,6 +28,9 @@ impl HandshakeEngine {
     // ── step 1: discovery ─────────────────────────────────────────────────────
 
     /// Device submits its manifest — broker validates and registers it.
+    ///
+    /// GIX Phase 3: stamps a `GixNamespace::MeshDevice` envelope for the
+    /// device_id so every registered device has a canonical GIX1 identity.
     pub fn register_device(&self, manifest: DeviceManifest) -> Result<(), VcpError> {
         // Signature verification deferred to the signing layer.
         // Here we validate structural invariants.
@@ -36,7 +39,28 @@ impl HandshakeEngine {
                 reason: "device_id must not be empty".into(),
             });
         }
+        let device_id = manifest.device_id.clone();
         self.registry.register(manifest);
+
+        let created_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let env = gix_types::Gix1::new(
+            gix_types::GixKind::Physical,
+            gix_types::GixNamespace::MeshDevice,
+            device_id.as_bytes(),
+            None,
+            created_at_ms,
+            gix_types::RoutingHints::default(),
+        );
+        tracing::info!(
+            device_id,
+            gix1_canonical_id = %hex::encode(env.canonical_id),
+            gix1_glyph = %env.glyph,
+            gix1_odu_base = env.odu_base,
+            "VCP device registered — GIX1 MeshDevice envelope stamped"
+        );
         Ok(())
     }
 

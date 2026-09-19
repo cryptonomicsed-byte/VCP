@@ -42,6 +42,11 @@ pub struct VcpReceipt {
     /// Set by ucx-osovm integration after Zàngbétò settlement.
     pub zangbeto_anchor: Option<String>,
 
+    /// GIX1 canonical_id (hex SHA-256) for this receipt — set by the caller
+    /// after computing `Gix1::new(Receipt, MeshDevice, receipt_id.as_bytes(), ...)`.
+    #[serde(default)]
+    pub gix1_canonical_id: Option<String>,
+
     /// Hex-encoded Ed25519 signature by the device over canonical JSON.
     pub device_signature: String,
     /// Hex-encoded Ed25519 signature by the agent over canonical JSON.

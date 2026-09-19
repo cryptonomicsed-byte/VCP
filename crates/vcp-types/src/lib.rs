@@ -15,6 +15,7 @@
 //!   7. RECEIPT     — VcpReceipt signed by device + agent + optional witness
 
 pub mod device;
+pub mod devices;
 pub mod error;
 pub mod handshake;
 pub mod receipt;
@@ -31,3 +32,4 @@ pub use handshake::{
 };
 pub use receipt::{VcpReceipt, SessionOutcome, WitnessAttestation};
 pub use session::{SessionId, SessionMessage, SessionMessageKind, TelemetryPoint};
+pub use devices::ZimaDevice;

@@ -10,6 +10,7 @@ path = "src/bin/main.rs"
 
 [dependencies]
 vcp-types          = { path = "../vcp-types" }
+gix-types          = { path = "../../../GIX/crates/gix-types" }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 uuid               = { workspace = true }
