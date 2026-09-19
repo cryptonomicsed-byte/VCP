@@ -199,6 +199,48 @@ impl HandshakeEngine {
         Ok(grant)
     }
 
+    // ── GIX Phase 4: cross-index composite identity ───────────────────────────
+
+    /// Compute the composite GIX1 fold identity for a completed VCP session.
+    ///
+    /// Folds the device's `MeshDevice` GIX1 canonical_id together with the
+    /// receipt's `MeshDevice` GIX1 canonical_id using `gix_fold_v1`, producing
+    /// a single deterministic session identity.
+    ///
+    /// Returns `None` if the session is not yet completed or the grant is missing.
+    pub fn session_composite_gix1(
+        &self,
+        session_id: Uuid,
+        receipt: &vcp_types::VcpReceipt,
+    ) -> Option<String> {
+        let grant = self.sessions.get_grant(session_id)?;
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let device_env = gix_types::Gix1::new(
+            gix_types::GixKind::Physical,
+            gix_types::GixNamespace::MeshDevice,
+            grant.device_id.as_bytes(),
+            None,
+            ts,
+            gix_types::RoutingHints::default(),
+        );
+        let receipt_env = gix_types::Gix1::new(
+            gix_types::GixKind::Receipt,
+            gix_types::GixNamespace::MeshDevice,
+            receipt.receipt_id.to_string().as_bytes(),
+            None,
+            ts,
+            gix_types::RoutingHints::default(),
+        );
+
+        let composite = gix_types::gix_fold_v1(&[device_env.canonical_id, receipt_env.canonical_id]);
+        Some(hex::encode(composite))
+    }
+
     // ── revocation ────────────────────────────────────────────────────────────
 
     pub fn revoke(
