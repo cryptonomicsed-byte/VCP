@@ -269,6 +269,27 @@ impl HandshakeEngine {
         Some(hex::encode(composite))
     }
 
+    // ── graph persistence ─────────────────────────────────────────────────────
+
+    /// Persist the cross-link `GlyphGraph` to `path` (JSON, atomic write).
+    ///
+    /// Call on graceful broker shutdown so `vcp_session` edges survive restarts.
+    pub fn save_graph(&self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+        let g = self.graph.read().map_err(|e| format!("graph lock poisoned: {e}"))?;
+        g.save(path)
+    }
+
+    /// Replace the in-memory `GlyphGraph` with the one persisted at `path`.
+    ///
+    /// Returns `Ok(())` if the file does not exist (fresh start).
+    /// Call during broker startup before accepting connections.
+    pub fn load_graph_from(&self, path: impl AsRef<std::path::Path>) -> Result<(), String> {
+        let loaded = gix_core::GlyphGraph::load(path)?;
+        let mut g = self.graph.write().map_err(|e| format!("graph lock poisoned: {e}"))?;
+        *g = loaded;
+        Ok(())
+    }
+
     // ── revocation ────────────────────────────────────────────────────────────
 
     pub fn revoke(
@@ -385,5 +406,36 @@ mod gix_tests {
         let engine = HandshakeEngine::new();
         let receipt = make_receipt(Uuid::new_v4());
         assert!(engine.session_composite_gix1(Uuid::new_v4(), &receipt).is_none());
+    }
+
+    #[test]
+    fn save_and_load_graph_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vcp_graph.json");
+
+        let (engine, sid) = engine_with_active_session();
+        let receipt = make_receipt(sid);
+        engine.session_composite_gix1(sid, &receipt);
+        assert_eq!(engine.graph.read().unwrap().edge_count(), 1);
+
+        engine.save_graph(&path).expect("save_graph should succeed");
+        assert!(path.exists());
+
+        // Fresh engine — no edges
+        let engine2 = HandshakeEngine::new();
+        assert_eq!(engine2.graph.read().unwrap().edge_count(), 0);
+
+        engine2.load_graph_from(&path).expect("load_graph_from should succeed");
+        assert_eq!(engine2.graph.read().unwrap().edge_count(), 1);
+        assert_eq!(engine2.graph.read().unwrap().node_count(), 2);
+    }
+
+    #[test]
+    fn load_graph_from_missing_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HandshakeEngine::new();
+        engine.load_graph_from(dir.path().join("no_graph.json"))
+            .expect("missing file should be a no-op");
+        assert_eq!(engine.graph.read().unwrap().edge_count(), 0);
     }
 }
