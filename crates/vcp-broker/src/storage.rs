@@ -3,184 +3,205 @@
 //! `StorageBackend` decouples the broker from the physical format so that
 //! JSON files (current), SQLite, or sled can all satisfy the same contract
 //! without touching GIX semantics.
+//!
+//! Phase 8B: upgraded to persist `CanonicalObjectStore` as an atomic unit —
+//! graph.json + index.json + snapshot.json are written together so they share
+//! the same epoch snapshot_id, preventing partial-write skew.
 
 use std::path::PathBuf;
 
-/// Save/load contract for GlyphGraph + Gix1Index.
+/// Save/load contract for the canonical GIX object store.
 ///
 /// Implementations must be `Send + Sync` so the broker can share them across
 /// async tasks behind an `Arc`.
 pub trait StorageBackend: Send + Sync {
-    /// Load the GlyphGraph from durable storage.
+    /// Load the full `CanonicalObjectStore` from durable storage.
     ///
-    /// Returns an empty graph when no prior state exists (first boot).
-    fn load_graph(&self) -> Result<gix_core::GlyphGraph, String>;
+    /// Returns an empty store when no prior state exists (first boot).
+    fn load_store(&self) -> Result<gix_core::CanonicalObjectStore, String>;
 
-    /// Persist the current GlyphGraph snapshot atomically.
-    fn save_graph(&self, graph: &gix_core::GlyphGraph) -> Result<(), String>;
-
-    /// Load the Gix1Index from durable storage.
+    /// Persist the current `CanonicalObjectStore` snapshot atomically.
     ///
-    /// Returns an empty index when no prior state exists.
-    fn load_index(&self) -> Result<gix_core::Gix1Index, String>;
-
-    /// Persist the current Gix1Index snapshot atomically.
-    fn save_index(&self, index: &gix_core::Gix1Index) -> Result<(), String>;
+    /// Stamps a new `snapshot_id` before writing so all three backing files
+    /// share the same epoch identifier.
+    fn save_store(&self, store: &mut gix_core::CanonicalObjectStore) -> Result<(), String>;
 }
 
 // ── JSON file backend (default) ───────────────────────────────────────────────
 
-/// Stores GlyphGraph and Gix1Index as pretty-printed JSON files.
+/// Stores the `CanonicalObjectStore` as three atomic JSON files:
+///   `{graph_path}`    — GlyphGraph
+///   `{index_path}`    — Gix1Index
+///   `{snapshot_path}` — GixSnapshotMeta (shared epoch id)
 ///
-/// Writes are atomic: data lands in a `.tmp` sibling first, then renamed.
 /// Configure via env vars:
-///   VCP_GRAPH_PATH  — path to graph JSON file  (default: vcp_graph.json)
-///   VCP_INDEX_PATH  — path to index JSON file  (default: vcp_index.json)
+///   VCP_GRAPH_PATH    — default: vcp_graph.json
+///   VCP_INDEX_PATH    — default: vcp_index.json
+///   VCP_SNAPSHOT_PATH — default: vcp_snapshot.json
 pub struct JsonFileBackend {
-    pub graph_path: PathBuf,
-    pub index_path: PathBuf,
+    pub graph_path:    PathBuf,
+    pub index_path:    PathBuf,
+    pub snapshot_path: PathBuf,
 }
 
 impl JsonFileBackend {
-    pub fn new(graph_path: impl Into<PathBuf>, index_path: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        graph_path:    impl Into<PathBuf>,
+        index_path:    impl Into<PathBuf>,
+        snapshot_path: impl Into<PathBuf>,
+    ) -> Self {
         Self {
-            graph_path: graph_path.into(),
-            index_path: index_path.into(),
+            graph_path:    graph_path.into(),
+            index_path:    index_path.into(),
+            snapshot_path: snapshot_path.into(),
         }
     }
 
     /// Build from environment variables, falling back to local defaults.
     pub fn from_env() -> Self {
-        let graph_path = std::env::var("VCP_GRAPH_PATH")
-            .unwrap_or_else(|_| "vcp_graph.json".into());
-        let index_path = std::env::var("VCP_INDEX_PATH")
-            .unwrap_or_else(|_| "vcp_index.json".into());
-        Self::new(graph_path, index_path)
+        Self::new(
+            std::env::var("VCP_GRAPH_PATH").unwrap_or_else(|_| "vcp_graph.json".into()),
+            std::env::var("VCP_INDEX_PATH").unwrap_or_else(|_| "vcp_index.json".into()),
+            std::env::var("VCP_SNAPSHOT_PATH").unwrap_or_else(|_| "vcp_snapshot.json".into()),
+        )
     }
 }
 
 impl StorageBackend for JsonFileBackend {
-    fn load_graph(&self) -> Result<gix_core::GlyphGraph, String> {
-        gix_core::GlyphGraph::load(&self.graph_path)
+    fn load_store(&self) -> Result<gix_core::CanonicalObjectStore, String> {
+        gix_core::load_store_from_files(&self.graph_path, &self.index_path, &self.snapshot_path)
     }
 
-    fn save_graph(&self, graph: &gix_core::GlyphGraph) -> Result<(), String> {
-        graph.save(&self.graph_path)
-    }
-
-    fn load_index(&self) -> Result<gix_core::Gix1Index, String> {
-        gix_core::Gix1Index::load(&self.index_path)
-    }
-
-    fn save_index(&self, index: &gix_core::Gix1Index) -> Result<(), String> {
-        index.save(&self.index_path)
+    fn save_store(&self, store: &mut gix_core::CanonicalObjectStore) -> Result<(), String> {
+        gix_core::save_store_to_files(store, &self.graph_path, &self.index_path, &self.snapshot_path)
     }
 }
 
-/// A no-op backend used in tests where persistence is not needed.
+// ── No-op backend for tests / in-memory mode ─────────────────────────────────
+
 pub struct NullBackend;
 
 impl StorageBackend for NullBackend {
-    fn load_graph(&self) -> Result<gix_core::GlyphGraph, String> {
-        Ok(gix_core::GlyphGraph::new())
+    fn load_store(&self) -> Result<gix_core::CanonicalObjectStore, String> {
+        Ok(gix_core::CanonicalObjectStore::new())
     }
-    fn save_graph(&self, _graph: &gix_core::GlyphGraph) -> Result<(), String> {
-        Ok(())
-    }
-    fn load_index(&self) -> Result<gix_core::Gix1Index, String> {
-        Ok(gix_core::Gix1Index::new())
-    }
-    fn save_index(&self, _index: &gix_core::Gix1Index) -> Result<(), String> {
+    fn save_store(&self, _store: &mut gix_core::CanonicalObjectStore) -> Result<(), String> {
         Ok(())
     }
 }
+
+// ── convenience wrapper ───────────────────────────────────────────────────────
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gix_types::{GixKind, GixNamespace, RoutingHints};
 
-    #[test]
-    fn json_backend_roundtrip_graph() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = JsonFileBackend::new(
-            dir.path().join("graph.json"),
-            dir.path().join("index.json"),
-        );
-
-        // Empty load succeeds before the file exists.
-        let g = backend.load_graph().expect("empty load");
-        assert_eq!(g.edge_count(), 0);
-
-        // Save and reload.
-        let mut g2 = gix_core::GlyphGraph::new();
-        g2.add_node(gix_types::GlyphNode::from_chunk("test-node", 1.0));
-        backend.save_graph(&g2).expect("save");
-
-        let g3 = backend.load_graph().expect("reload");
-        assert_eq!(g3.node_count(), 1);
+    fn make_env(bytes: &[u8]) -> gix_types::Gix1 {
+        gix_types::Gix1::new(
+            GixKind::Physical, GixNamespace::MeshDevice,
+            bytes, None, 1_700_000_000_000, RoutingHints::default(),
+        )
     }
 
     #[test]
-    fn json_backend_roundtrip_index() {
+    fn json_backend_roundtrip_store() {
         let dir = tempfile::tempdir().unwrap();
         let backend = JsonFileBackend::new(
             dir.path().join("graph.json"),
             dir.path().join("index.json"),
+            dir.path().join("snapshot.json"),
         );
 
-        let idx = backend.load_index().expect("empty index load");
-        assert_eq!(idx.root(), gix_types::GIX1_EMPTY_ROOT);
+        // Empty load succeeds before any files exist.
+        let s = backend.load_store().expect("first boot");
+        assert_eq!(s.graph.edge_count(), 0);
 
-        backend.save_index(&idx).expect("save empty index");
-        let idx2 = backend.load_index().expect("reload");
-        assert_eq!(idx2.root(), gix_types::GIX1_EMPTY_ROOT);
+        // Insert an object and save.
+        let mut store = gix_core::CanonicalObjectStore::new();
+        store.insert_object(make_env(b"test-device"));
+        backend.save_store(&mut store).expect("save");
+
+        // Reload and audit.
+        let loaded = backend.load_store().expect("reload");
+        loaded.audit_consistency().expect("loaded store must audit");
+        assert_eq!(loaded.index.len(), 1);
+    }
+
+    #[test]
+    fn json_backend_snapshot_id_is_stable_across_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = JsonFileBackend::new(
+            dir.path().join("graph.json"),
+            dir.path().join("index.json"),
+            dir.path().join("snapshot.json"),
+        );
+
+        let mut store = gix_core::CanonicalObjectStore::new();
+        store.insert_object(make_env(b"node"));
+        backend.save_store(&mut store).expect("save");
+        let saved_id = store.snapshot_id().to_string();
+
+        let loaded = backend.load_store().expect("reload");
+        assert_eq!(loaded.snapshot_id(), saved_id,
+            "snapshot_id must survive save/load cycle");
     }
 
     #[test]
     fn null_backend_is_always_ok() {
         let b = NullBackend;
-        assert!(b.load_graph().is_ok());
-        let g = gix_core::GlyphGraph::new();
-        assert!(b.save_graph(&g).is_ok());
-        assert!(b.load_index().is_ok());
-        let idx = gix_core::Gix1Index::new();
-        assert!(b.save_index(&idx).is_ok());
+        let s = b.load_store().unwrap();
+        assert_eq!(s.graph.node_count(), 0);
+        let mut s2 = gix_core::CanonicalObjectStore::new();
+        assert!(b.save_store(&mut s2).is_ok());
     }
 
-    /// Crash-recovery: a stale `.tmp` file from an interrupted write must not
-    /// prevent the previous valid graph from loading.
+    /// Crash-recovery: a stale `.tmp` file does not corrupt the live graph.
     #[test]
     fn stale_tmp_file_does_not_corrupt_load() {
         let dir = tempfile::tempdir().unwrap();
         let graph_path = dir.path().join("graph.json");
-        let backend = JsonFileBackend::new(&graph_path, dir.path().join("index.json"));
+        let backend = JsonFileBackend::new(
+            &graph_path,
+            dir.path().join("index.json"),
+            dir.path().join("snapshot.json"),
+        );
 
-        // Write a valid graph.
-        let mut g = gix_core::GlyphGraph::new();
-        g.add_node(gix_types::GlyphNode::from_chunk("stable-node", 1.0));
-        backend.save_graph(&g).expect("initial save");
+        let mut store = gix_core::CanonicalObjectStore::new();
+        store.insert_object(make_env(b"stable"));
+        backend.save_store(&mut store).expect("save");
 
-        // Simulate an interrupted write: leave a corrupt .tmp sibling.
-        let tmp = graph_path.with_extension("tmp");
-        std::fs::write(&tmp, b"{ invalid json ]").unwrap();
+        // Inject a corrupt .tmp sibling.
+        std::fs::write(graph_path.with_extension("tmp"), b"{ bad json ]").unwrap();
 
-        // The valid graph file is still intact and loads correctly.
-        let loaded = backend.load_graph().expect("should load valid graph despite stale .tmp");
-        assert_eq!(loaded.node_count(), 1, "valid graph survives stale tmp file");
+        let loaded = backend.load_store().expect("valid graph survives stale tmp");
+        assert_eq!(loaded.index.len(), 1);
     }
 
-    /// Phase 8A recovery: with_storage returns empty graph on missing file, not an error.
+    /// Phase 8B: with_storage restores BOTH structures.
     #[test]
-    fn with_storage_boots_empty_on_missing_files() {
+    fn with_storage_restores_index_and_graph() {
         use std::sync::Arc;
         let dir = tempfile::tempdir().unwrap();
         let backend: Arc<dyn StorageBackend> = Arc::new(JsonFileBackend::new(
-            dir.path().join("no_graph.json"),
-            dir.path().join("no_index.json"),
+            dir.path().join("g.json"),
+            dir.path().join("i.json"),
+            dir.path().join("s.json"),
         ));
+
+        // Seed durable state.
+        let mut seed = gix_core::CanonicalObjectStore::new();
+        seed.insert_object(make_env(b"device-001"));
+        seed.insert_object(make_env(b"device-002"));
+        backend.save_store(&mut seed).unwrap();
+
+        // Restart.
         let engine = crate::handshake_engine::HandshakeEngine::with_storage(backend)
-            .expect("missing file = first boot, not an error");
-        let g = engine.graph.read().unwrap();
-        assert_eq!(g.edge_count(), 0);
+            .expect("restore must succeed");
+        let s = engine.store.read().unwrap();
+        assert_eq!(s.index.len(), 2,   "index must be restored");
+        assert_eq!(s.graph.node_count(), 2, "graph must be restored");
+        s.audit_consistency().expect("restored store must audit");
     }
 }

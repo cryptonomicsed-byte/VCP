@@ -8,3 +8,4 @@ pub use registry::DeviceRegistry;
 pub use session_store::SessionStore;
 pub use handshake_engine::HandshakeEngine;
 pub use storage::{JsonFileBackend, NullBackend, StorageBackend};
+// flush helper is pub(crate) — exposed via HandshakeEngine::flush_store

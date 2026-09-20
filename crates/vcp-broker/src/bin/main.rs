@@ -227,9 +227,9 @@ async fn main() {
     let shutdown_engine = engine.clone();
     let shutdown_signal = async move {
         tokio::signal::ctrl_c().await.ok();
-        tracing::info!("vcp-broker shutting down — flushing GIX graph");
-        if let Err(e) = shutdown_engine.flush_graph() {
-            tracing::error!("GIX graph final flush failed: {e}");
+        tracing::info!("vcp-broker shutting down — flushing GIX store");
+        if let Err(e) = shutdown_engine.flush_store() {
+            tracing::error!("GIX store final flush failed: {e}");
         }
     };
 
