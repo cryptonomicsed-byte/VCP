@@ -2,6 +2,34 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use vcp_types::VcpError;
 
+/// Returns `Err` when `VCP_REQUIRE_PUBKEY=true` and `public_key_hex` is empty.
+///
+/// Use this at the auth/verify callsite to enforce that no device can claim
+/// an identity without supplying a real Ed25519 public key in production.
+/// When the env var is absent or not `"true"` the function is a no-op (dev
+/// mode) and logs a warning so the bypass is visible in server output.
+pub fn require_pubkey_in_production(
+    device_id: &str,
+    public_key_hex: &str,
+) -> Result<(), VcpError> {
+    if public_key_hex.is_empty() {
+        if std::env::var("VCP_REQUIRE_PUBKEY").unwrap_or_default() == "true" {
+            return Err(VcpError::ChallengeFailed {
+                reason: format!(
+                    "device '{}' has no public_key — device public key required in production mode \
+                     (VCP_REQUIRE_PUBKEY=true). Supply an Ed25519 public key or unset VCP_REQUIRE_PUBKEY.",
+                    device_id
+                ),
+            });
+        }
+        tracing::warn!(
+            device_id,
+            "VCP: empty public_key — skipping Ed25519 verification (dev mode)"
+        );
+    }
+    Ok(())
+}
+
 /// Verify an Ed25519 signature over the canonical auth message.
 ///
 /// Auth message = SHA-256(challenge_id || ":" || nonce)

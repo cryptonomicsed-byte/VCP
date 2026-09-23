@@ -7,7 +7,7 @@ use vcp_types::{
 };
 
 use crate::{DeviceRegistry, SessionStore};
-use crate::crypto::verify_auth_signature;
+use crate::crypto::{require_pubkey_in_production, verify_auth_signature};
 use crate::storage::StorageBackend;
 
 /// Local-development escape hatch for keyless devices.
@@ -230,6 +230,10 @@ impl HandshakeEngine {
         // verification here. An unverifiable auth attempt is a failed auth
         // attempt.
         if manifest.public_key.is_empty() {
+            // VCP_REQUIRE_PUBKEY=true (production gate) takes priority and
+            // returns an error regardless of VCP_ALLOW_UNVERIFIED_DEVICES.
+            require_pubkey_in_production(&auth.device_id, &manifest.public_key)?;
+
             if !allow_unverified_devices() {
                 return Err(VcpError::ChallengeFailed {
                     reason: format!(
