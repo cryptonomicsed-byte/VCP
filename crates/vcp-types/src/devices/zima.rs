@@ -86,8 +86,12 @@ impl ZimaDevice {
             issued_at: Utc::now(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(24)),
 
-            // Device keys are provisioned at runtime by the VCP broker.
-            // Empty strings here → broker fills in during registration.
+            // IMPORTANT: the VCP broker does NOT generate device keys.
+            // An empty public_key is now rejected at registration (audit
+            // finding E-31), because a keyless device would skip Ed25519
+            // verification entirely. Generate the Ed25519 keypair on the
+            // device, then set `public_key` here before calling
+            // POST /v1/devices/register.
             public_key: String::new(),
             signature:  String::new(),
         }

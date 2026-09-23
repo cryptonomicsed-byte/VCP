@@ -10,6 +10,20 @@ use crate::{DeviceRegistry, SessionStore};
 use crate::crypto::verify_auth_signature;
 use crate::storage::StorageBackend;
 
+/// Local-development escape hatch for keyless devices.
+///
+/// Production must never set this. A device with no public key cannot be
+/// authenticated, so accepting one is equivalent to accepting anonymous
+/// callers into the capability-negotiation path. It is an env var rather
+/// than a compile-time feature deliberately: the bypass shows up in `ps`
+/// and systemd unit review instead of hiding inside a build.
+fn allow_unverified_devices() -> bool {
+    matches!(
+        std::env::var("VCP_ALLOW_UNVERIFIED_DEVICES").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
 /// Drives the 7-step VCP handshake state machine.
 ///
 /// One HandshakeEngine instance is shared across all concurrent sessions.
@@ -97,6 +111,33 @@ impl HandshakeEngine {
                 reason: "device_id must not be empty".into(),
             });
         }
+        // Fail closed on keyless devices. Historically an empty `public_key`
+        // meant the device skipped Ed25519 verification entirely at auth time
+        // (`handle_auth` only verified `if !public_key.is_empty()`), so anyone
+        // who registered a keyless manifest could impersonate it and obtain
+        // capability grants with no signature at all.
+        //
+        // A keyed device is the only one the broker can ever authenticate, so
+        // an empty key is a provisioning bug, not a valid state. `VCP_ALLOW_
+        // UNVERIFIED_DEVICES=1` exists for local development only and logs
+        // loudly; production must never set it.
+        if manifest.public_key.is_empty() && !allow_unverified_devices() {
+            return Err(VcpError::ChallengeFailed {
+                reason: format!(
+                    "device '{}' has an empty public_key — refusing to register a device that \
+                     can never be authenticated. Provision the Ed25519 public key first, or set \
+                     VCP_ALLOW_UNVERIFIED_DEVICES=1 for local development only.",
+                    manifest.device_id
+                ),
+            });
+        }
+        if manifest.public_key.is_empty() {
+            tracing::warn!(
+                device_id = %manifest.device_id,
+                "registering device with EMPTY public_key — VCP_ALLOW_UNVERIFIED_DEVICES is set; \
+                 this device will not be cryptographically authenticated"
+            );
+        }
         let device_id = manifest.device_id.clone();
         self.registry.register(manifest);
 
@@ -183,7 +224,26 @@ impl HandshakeEngine {
         let manifest = self.registry.get(&auth.device_id)
             .ok_or_else(|| VcpError::DeviceNotFound { device_id: auth.device_id.clone() })?;
 
-        if !manifest.public_key.is_empty() {
+        // Defense in depth: `register_device` refuses keyless devices, but an
+        // engine restored from a pre-existing on-disk registry (or built by a
+        // caller that bypassed registration) must not silently skip signing
+        // verification here. An unverifiable auth attempt is a failed auth
+        // attempt.
+        if manifest.public_key.is_empty() {
+            if !allow_unverified_devices() {
+                return Err(VcpError::ChallengeFailed {
+                    reason: format!(
+                        "device '{}' has no public_key — cannot verify auth signature. \
+                         Refusing the session (set VCP_ALLOW_UNVERIFIED_DEVICES=1 for local dev only).",
+                        auth.device_id
+                    ),
+                });
+            }
+            tracing::warn!(
+                device_id = %auth.device_id,
+                "VCP_ALLOW_UNVERIFIED_DEVICES set — accepting auth WITHOUT signature verification"
+            );
+        } else {
             let challenge = self.sessions.get_challenge(session_id)
                 .ok_or_else(|| VcpError::SessionNotFound {
                     session_id: session_id.to_string(),
@@ -489,6 +549,58 @@ mod gix_tests {
     fn session_composite_returns_none_for_missing_session() {
         let engine = HandshakeEngine::new();
         assert!(engine.session_composite_gix1(Uuid::new_v4(), &make_receipt(Uuid::new_v4())).is_none());
+    }
+
+    fn manifest_with_key(device_id: &str, public_key: &str) -> vcp_types::DeviceManifest {
+        use vcp_types::device::{DeviceClass, SafetyClass};
+        vcp_types::DeviceManifest {
+            device_id: device_id.into(),
+            label: "test device".into(),
+            owner_did: "did:test:owner".into(),
+            class: DeviceClass::SensorNode,
+            safety_class: SafetyClass::Observer,
+            capabilities: vec![],
+            vcp_version: 1,
+            firmware: "test/0".into(),
+            issued_at: Utc::now(),
+            expires_at: None,
+            public_key: public_key.into(),
+            signature: String::new(),
+        }
+    }
+
+    /// Regression test for the empty-pubkey bypass (audit finding E-31).
+    ///
+    /// A keyless manifest previously registered successfully, and
+    /// `handle_auth` then skipped Ed25519 verification entirely for that
+    /// device — so a caller who registered `public_key: ""` obtained a
+    /// capability mediation with no signature at all. Registration must now
+    /// fail closed.
+    #[test]
+    fn register_device_rejects_empty_public_key() {
+        let engine = HandshakeEngine::new();
+        let err = engine
+            .register_device(manifest_with_key("dev-keyless", ""))
+            .expect_err("keyless device must not register");
+        assert!(
+            err.to_string().contains("empty public_key"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            engine.registry.get("dev-keyless").is_none(),
+            "rejected device must not be reachable in the registry"
+        );
+    }
+
+    /// A device that *does* carry an Ed25519 public key still registers —
+    /// the gate must not break the normal path.
+    #[test]
+    fn register_device_accepts_valid_public_key() {
+        let engine = HandshakeEngine::new();
+        engine
+            .register_device(manifest_with_key("dev-keyed", &"ab".repeat(32)))
+            .expect("keyed device must register");
+        assert!(engine.registry.get("dev-keyed").is_some());
     }
 
     /// Legacy path-based save/load still works (escape hatch).
